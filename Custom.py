@@ -1,5 +1,5 @@
 import numpy as np
-from sklearn.neighbors import KNeighborsClassifier
+from sklearn.neighbors import KNeighborsClassifier, NearestNeighbors
 from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
 from sklearn.utils.multiclass import unique_labels
 from scipy.stats import mode, entropy
@@ -224,183 +224,134 @@ class StabilityAdaptiveKNN(BaseAdaptiveKNN):
         return self
 
 
-# --- 2. Entropy Adaptive KNN ---
-class EntropyAdaptiveKNN(BaseAdaptiveKNN):
-    def __init__(self, entropy_threshold=0.1, entropy_patience=2,
-                 min_entropy_decrease=0.01, k_step_entropy=1,
-                 max_k_adaptive=None, weights='uniform', algorithm='auto',
-                 leaf_size=30, p=2, metric='minkowski',
+# --- 2. Confidence Adaptive KNN ---
+class ConfidenceAdaptiveKNN(BaseAdaptiveKNN):
+    def __init__(self, confidence_threshold=0.8, max_k_adaptive=None, weights='uniform', 
+                 algorithm='auto', leaf_size=30, p=2, metric='minkowski', 
                  metric_params=None, n_jobs=None):
-        super().__init__(max_k_adaptive=max_k_adaptive, weights=weights, algorithm=algorithm,
-                         leaf_size=leaf_size, p=p, metric=metric,
-                         metric_params=metric_params, n_jobs=n_jobs)
-        self.entropy_threshold = entropy_threshold
-        self.entropy_patience = entropy_patience
-        self.min_entropy_decrease = min_entropy_decrease
-        self.k_step_entropy = max(1, k_step_entropy)
-
+        super().__init__(max_k_adaptive=max_k_adaptive, weights=weights, 
+                         algorithm=algorithm, leaf_size=leaf_size, p=p, 
+                         metric=metric, metric_params=metric_params, n_jobs=n_jobs)
+        self.confidence_threshold = confidence_threshold
+        
     def _get_adaptive_k_neighbors_for_sample(self, all_sample_neigh_dist, all_sample_neigh_ind):
-        if not all_sample_neigh_ind.size: return np.array([]), np.array([]), 0
-
-        last_entropy_val = float('inf')
-        entropy_stable_count = 0
+        max_confidence = 0
+        best_k = 1
+        best_indices = all_sample_neigh_ind[:1]
+        best_distances = all_sample_neigh_dist[:1]
         
-        # L'entropia è significativa per k >= 2. Inizializziamo final_k a 1.
-        final_k = 1
-        final_indices = all_sample_neigh_ind[:1]
-        final_distances = all_sample_neigh_dist[:1]
-        
-        # Il loop inizia da un k che permette il calcolo dell'entropia (almeno 2)
-        # e rispetta k_step_entropy.
-        min_k_for_loop = max(2, self.k_step_entropy)
-        if self.k_step_entropy == 1 and min_k_for_loop == 1: min_k_for_loop = 2
-
-
-        # Se max_k_to_consider_ è troppo piccolo per il loop
-        if min_k_for_loop > self.max_k_to_consider_ :
-            # Restituisci k=1 (già impostato) o max_k_to_consider_ se è 1
-            if self.max_k_to_consider_ == 1:
-                return final_indices, final_distances, final_k
-            else: # max_k_to_consider_ è 0
-                return np.array([]), np.array([]), 0
-
-        for k_candidate in range(min_k_for_loop, self.max_k_to_consider_ + 1, self.k_step_entropy):
-            current_indices_slice = all_sample_neigh_ind[:k_candidate]
-            current_distances_slice = all_sample_neigh_dist[:k_candidate]
-
-            if not current_indices_slice.size: break
-
-            neighbor_labels = self._y[current_indices_slice]
-            class_counts = np.array([np.sum(neighbor_labels == c) for c in self.classes_], dtype=float)
+        # Cerca il k che fornisce la massima confidenza
+        for k in range(1, len(all_sample_neigh_ind) + 1):
+            current_indices = all_sample_neigh_ind[:k]
+            current_distances = all_sample_neigh_dist[:k]
+            y_neighbor_labels = self._y[current_indices]
             
-            current_entropy_val = float('inf') # Default se non calcolabile
-            if np.sum(class_counts) > 0 : # Assicura che ci siano conteggi > 0
-                 class_probas = class_counts / np.sum(class_counts)
-                 # Calcola entropia solo per probabilità > 0 per evitare log(0)
-                 current_entropy_val = entropy(class_probas[class_probas > 0], base=2)
+            # Calcola la confidenza come proporzione della classe maggioritaria
+            if self.weights == 'uniform':
+                class_counts = np.bincount(y_neighbor_labels, minlength=len(self.classes_))
+                max_count = np.max(class_counts)
+                confidence = max_count / k
+            elif self.weights == 'distance':
+                weights = 1.0 / (current_distances + 1e-9)
+                weighted_votes = {}
+                for i, label in enumerate(y_neighbor_labels):
+                    weighted_votes[label] = weighted_votes.get(label, 0) + weights[i]
+                confidence = max(weighted_votes.values()) / sum(weighted_votes.values())
             
-            # Aggiorna sempre, così se una condizione di stop è soddisfatta, k_candidate è il k scelto
-            final_k = k_candidate
-            final_distances = current_distances_slice
-            final_indices = current_indices_slice
-
-            if current_entropy_val < self.entropy_threshold: break 
-            if (last_entropy_val - current_entropy_val) < self.min_entropy_decrease:
-                entropy_stable_count += 1
-            else:
-                entropy_stable_count = 0
-            
-            if entropy_stable_count >= self.entropy_patience: break 
-            last_entropy_val = current_entropy_val
-        
-        return final_distances, final_indices, final_k
-
+            # Aggiorna il miglior k se migliora la confidenza
+            if confidence > max_confidence:
+                max_confidence = confidence
+                best_k = k
+                best_indices = current_indices
+                best_distances = current_distances
+                
+            # Se la confidenza è sufficientemente alta, termina la ricerca
+            if confidence >= self.confidence_threshold:
+                break
+                
+        return best_distances, best_indices, best_k
+    
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
-        params['entropy_threshold'] = self.entropy_threshold
-        params['entropy_patience'] = self.entropy_patience
-        params['min_entropy_decrease'] = self.min_entropy_decrease
-        params['k_step_entropy'] = self.k_step_entropy
+        params['confidence_threshold'] = self.confidence_threshold
         return params
 
     def set_params(self, **params):
-        p_names = ['entropy_threshold', 'entropy_patience', 'min_entropy_decrease', 'k_step_entropy']
-        for name in p_names:
-            if name in params: setattr(self, name, params.pop(name))
+        if 'confidence_threshold' in params:
+            self.confidence_threshold = params.pop('confidence_threshold')
         super().set_params(**params)
         return self
+    
 
 
-# --- 3. Local LOO-CV Adaptive KNN ---
-class LocalLOOCVAdaptiveKNN(BaseAdaptiveKNN):
-    def __init__(self, min_k_loo=2, k_step_loo=1,
-                 max_k_adaptive=None, weights='uniform', algorithm='auto',
-                 leaf_size=30, p=2, metric='minkowski',
-                 metric_params=None, n_jobs=None):
-        super().__init__(max_k_adaptive=max_k_adaptive, weights=weights, algorithm=algorithm,
-                         leaf_size=leaf_size, p=p, metric=metric,
-                         metric_params=metric_params, n_jobs=n_jobs)
-        self.min_k_loo = max(2, min_k_loo) # LOO ha senso per k_cv >= 2 (k_cv-1 >= 1 vicini per predire)
-        self.k_step_loo = max(1, k_step_loo)
 
-    def _predict_loo_internal(self, loo_neighbor_indices_for_pred):
-        """
-        Predizione interna per LOO-CV. USA SEMPRE PESI UNIFORMI per semplicità,
-        perché calcolare le distanze tra i vicini stessi è costoso.
-        Prende gli indici dei vicini da usare per la predizione.
-        """
-        if not loo_neighbor_indices_for_pred.size: return None # Non può predire
+# --- 3. Density Confidence Adaptive KNN ---
+class DensityConfidenceKNN(BaseAdaptiveKNN):
+    def __init__(self, confidence_threshold=0.7, density_quantile=0.8, max_k_adaptive=None, 
+                 weights='uniform', algorithm='auto', leaf_size=30, p=2, 
+                 metric='minkowski', metric_params=None, n_jobs=None):
+        super().__init__(max_k_adaptive=max_k_adaptive, weights=weights, 
+                         algorithm=algorithm, leaf_size=leaf_size, p=p, 
+                         metric=metric, metric_params=metric_params, n_jobs=n_jobs)
+        self.confidence_threshold = confidence_threshold
+        self.density_quantile = density_quantile
+        
+    def fit(self, X, y):
+        super().fit(X, y)
+        
+        # Calcola la densità locale per ogni punto di training
+        # (inverso della distanza media dai 10 vicini più prossimi)
+        n_density_neighbors = min(10, X.shape[0] - 1)
+        if n_density_neighbors > 0:
+            knn = NearestNeighbors(n_neighbors=n_density_neighbors + 1)
+            knn.fit(X)
+            distances, _ = knn.kneighbors(X)
+            # Ignora la distanza a se stesso (sempre 0)
+            self.local_density_ = 1.0 / (np.mean(distances[:, 1:], axis=1) + 1e-9)
             
-        labels_for_pred = self._y[loo_neighbor_indices_for_pred]
-        pred_class, _ = mode(labels_for_pred, keepdims=False) if hasattr(mode(labels_for_pred), 'mode') else (mode(labels_for_pred)[0], mode(labels_for_pred)[1])
-        return pred_class[0] if isinstance(pred_class, (np.ndarray, list)) else pred_class
-
-
+            # Calcola soglie di densità
+            self.density_threshold_ = np.quantile(self.local_density_, self.density_quantile)
+        return self
+        
     def _get_adaptive_k_neighbors_for_sample(self, all_sample_neigh_dist, all_sample_neigh_ind):
-        if not all_sample_neigh_ind.size: return np.array([]), np.array([]), 0
-
-        best_k_cv = 1 # Default k=1
-        max_loo_accuracy = -1.0 
-
-        # Assicura che min_k_loo sia fattibile
-        actual_min_k_loo_loop = self.min_k_loo
-        if actual_min_k_loo_loop > self.max_k_to_consider_:
-            # Non abbastanza vicini per il loop LOO, usa k=1 o max_k_to_consider_
-            k_to_use = min(1, self.max_k_to_consider_) if self.max_k_to_consider_ >=1 else 0
-            if k_to_use == 0: return np.array([]), np.array([]), 0
-            return all_sample_neigh_dist[:k_to_use], all_sample_neigh_ind[:k_to_use], k_to_use
-
-        # Itera attraverso i k_cv candidati per il processo LOO
-        for k_cv in range(actual_min_k_loo_loop, self.max_k_to_consider_ + 1, self.k_step_loo):
-            # Vicini considerati per questo k_cv
-            current_k_cv_indices = all_sample_neigh_ind[:k_cv]
+        if not all_sample_neigh_ind.size:
+            return np.array([]), np.array([]), 0
             
-            correct_loo_preds = 0
-            num_loo_attempts = 0
-
-            # Esegui LOO-CV su questi k_cv vicini
-            for i in range(k_cv): # i è l'indice del vicino da "lasciare fuori"
-                loo_out_neighbor_true_label = self._y[current_k_cv_indices[i]]
-                
-                # Indici degli altri k_cv-1 vicini usati per la predizione interna
-                loo_in_indices_for_pred = np.delete(current_k_cv_indices, i)
-
-                if not loo_in_indices_for_pred.size: continue # Non ci sono vicini per predire
-
-                num_loo_attempts +=1
-                predicted_label_for_loo_out = self._predict_loo_internal(loo_in_indices_for_pred)
-                
-                if predicted_label_for_loo_out is not None and \
-                   predicted_label_for_loo_out == loo_out_neighbor_true_label:
-                    correct_loo_preds += 1
-            
-            current_loo_accuracy = 0.0
-            if num_loo_attempts > 0:
-                current_loo_accuracy = correct_loo_preds / num_loo_attempts
-            
-            # Aggiorna best_k_cv se questa accuratezza LOO è migliore
-            # Tie-breaking: preferisci k più piccolo (gestito implicitamente se aggiorni solo con >)
-            if current_loo_accuracy > max_loo_accuracy:
-                max_loo_accuracy = current_loo_accuracy
-                best_k_cv = k_cv
-            # Se l'accuratezza è la stessa, manteniamo il k più piccolo già trovato
+        # Determina se il punto è in una regione ad alta o bassa densità
+        # calcolando la densità dei suoi vicini
+        neighbor_densities = [self.local_density_[idx] for idx in all_sample_neigh_ind[:5]]
+        avg_neighbor_density = np.mean(neighbor_densities)
         
-        # Se nessun k_cv nel loop ha dato un'accuratezza > -1 (es. loop non eseguito),
-        # best_k_cv rimarrà 1.
-        final_k = best_k_cv
-        final_distances = all_sample_neigh_dist[:final_k]
-        final_indices = all_sample_neigh_ind[:final_k]
-        
-        return final_distances, final_indices, final_k
-
+        # Per regioni ad alta densità, usiamo più vicini
+        if avg_neighbor_density > self.density_threshold_:
+            # In regioni dense, cerchiamo alta confidenza
+            max_confidence = 0
+            best_k = 1
+            
+            for k in range(1, len(all_sample_neigh_ind) + 1):
+                y_neighbor_labels = self._y[all_sample_neigh_ind[:k]]
+                class_counts = np.bincount(y_neighbor_labels, minlength=len(self.classes_))
+                confidence = np.max(class_counts) / k
+                
+                if confidence > max_confidence:
+                    max_confidence = confidence
+                    best_k = k
+                    
+                if confidence >= self.confidence_threshold:
+                    break
+        else:
+            # In regioni sparse, usiamo meno vicini (più localizzato)
+            best_k = max(1, int(len(all_sample_neigh_ind) * 0.3))
+            
+        return all_sample_neigh_dist[:best_k], all_sample_neigh_ind[:best_k], best_k
+    
     def get_params(self, deep=True):
         params = super().get_params(deep=deep)
-        params['min_k_loo'] = self.min_k_loo
-        params['k_step_loo'] = self.k_step_loo
+        params['confidence_threshold'] = self.confidence_threshold
         return params
 
     def set_params(self, **params):
-        if 'min_k_loo' in params: self.min_k_loo = params.pop('min_k_loo')
-        if 'k_step_loo' in params: self.k_step_loo = params.pop('k_step_loo')
+        if 'confidence_threshold' in params:
+            self.confidence_threshold = params.pop('confidence_threshold')
         super().set_params(**params)
         return self
